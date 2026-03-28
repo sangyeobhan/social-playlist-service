@@ -3,16 +3,19 @@ package com.codeit.sb02mplteam2.domain.livewatch.redis;
 import com.codeit.sb02mplteam2.domain.livewatch.dto.response.ParticipantResponseDto;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.stereotype.Service;
-
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DataAccessException;
+import org.springframework.data.redis.core.RedisOperations;
+import org.springframework.data.redis.core.SessionCallback;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.stereotype.Service;
 
 @Service
 @RequiredArgsConstructor
@@ -29,10 +32,13 @@ public class RedisLiveWatchParticipantService {
   ) {}
 
   public void joinRoom(Long roomId, Long userId, String username, String profileUrl) {
-    leaveFromCurrentRoom(userId);
-
     String participantsKey = RedisKeyPatterns.roomParticipants(roomId);
     String userField = RedisKeyPatterns.userField(userId);
+    String currentRoomKey = RedisKeyPatterns.userCurrentRoom(userId);
+    Duration ttl = RedisTTLStrategy.PARTICIPANT_SESSION.getDuration();
+
+    // Phase 1: 이전 방 확인 (동기 — 결과에 따라 HDEL 여부 결정)
+    Long oldRoomId = getCurrentRoom(userId);
 
     ParticipantData data = new ParticipantData(
         username,
@@ -40,16 +46,29 @@ public class RedisLiveWatchParticipantService {
         LocalDateTime.now()
     );
 
+    String json;
     try {
-      String json = objectMapper.writeValueAsString(data);
-      stringRedisTemplate.opsForHash().put(participantsKey, userField, json);
+      json = objectMapper.writeValueAsString(data);
     } catch (JsonProcessingException e) {
       throw new RuntimeException("참가자 데이터 직렬화 실패", e);
     }
 
-    stringRedisTemplate.expire(participantsKey, RedisTTLStrategy.PARTICIPANT_SESSION.getDuration());
-
-    setCurrentRoom(userId, roomId);
+    // Phase 2: 파이프라인 (1 RT)
+    stringRedisTemplate.executePipelined(new SessionCallback<Object>() {
+      @Override
+      public <K, V> Object execute(RedisOperations<K, V> operations) throws DataAccessException {
+        RedisOperations<String, String> ops = (RedisOperations<String, String>) operations;
+        if (oldRoomId != null && !oldRoomId.equals(roomId)) {
+          String oldKey = RedisKeyPatterns.roomParticipants(oldRoomId);
+          ops.opsForHash().delete(oldKey, userField);
+        }
+        ops.opsForHash().put(participantsKey, userField, json);
+        ops.expire(participantsKey, ttl);
+        ops.opsForValue().set(currentRoomKey, roomId.toString());
+        ops.expire(currentRoomKey, ttl);
+        return null;
+      }
+    });
 
     log.info("사용자 {}가 채팅방 {}에 입장", userId, roomId);
   }
@@ -57,10 +76,17 @@ public class RedisLiveWatchParticipantService {
   public void leaveRoom(Long roomId, Long userId) {
     String participantsKey = RedisKeyPatterns.roomParticipants(roomId);
     String userField = RedisKeyPatterns.userField(userId);
+    String currentRoomKey = RedisKeyPatterns.userCurrentRoom(userId);
 
-    stringRedisTemplate.opsForHash().delete(participantsKey, userField);
-
-    clearCurrentRoom(userId);
+    stringRedisTemplate.executePipelined(new SessionCallback<Object>() {
+      @Override
+      public <K, V> Object execute(RedisOperations<K, V> operations) throws DataAccessException {
+        RedisOperations<String, String> ops = (RedisOperations<String, String>) operations;
+        ops.opsForHash().delete(participantsKey, userField);
+        ops.delete(currentRoomKey);
+        return null;
+      }
+    });
 
     log.info("Redis: 사용자 {}가 채팅방 {}에서 퇴장", userId, roomId);
   }
@@ -102,28 +128,6 @@ public class RedisLiveWatchParticipantService {
 
     String roomIdStr = stringRedisTemplate.opsForValue().get(currentRoomKey);
     return roomIdStr != null ? Long.parseLong(roomIdStr) : null;
-  }
-
-  private void setCurrentRoom(Long userId, Long roomId) {
-    String currentRoomKey = RedisKeyPatterns.userCurrentRoom(userId);
-
-    stringRedisTemplate.opsForValue().set(currentRoomKey, roomId.toString());
-
-    stringRedisTemplate.expire(currentRoomKey, RedisTTLStrategy.PARTICIPANT_SESSION.getDuration());
-  }
-
-  private void clearCurrentRoom(Long userId) {
-    String currentRoomKey = RedisKeyPatterns.userCurrentRoom(userId);
-
-    stringRedisTemplate.delete(currentRoomKey);
-  }
-
-  private void leaveFromCurrentRoom(Long userId) {
-    Long currentRoomId = getCurrentRoom(userId);
-    if (currentRoomId != null) {
-      leaveRoom(currentRoomId, userId);
-      log.info("Redis: 사용자 {}를 이전 채팅방 {}에서 제거", userId, currentRoomId);
-    }
   }
 
   private ParticipantResponseDto parseParticipant(String fieldKey, String jsonValue) {
